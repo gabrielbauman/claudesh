@@ -275,7 +275,7 @@ fn execute_line(
             }
             0
         }
-        InputKind::Judgy(_) => {
+        InputKind::Judgy(_) | InputKind::Yolo(_) => {
             // Handled only in interactive mode; no-op in non-interactive
             0
         }
@@ -346,6 +346,8 @@ fn run_interactive(config: &Config) -> ExitCode {
     let is_root = is_user_root();
     let mut last_exit: i32 = 0;
 
+    // Yolo mode state — initialized from config file, toggled by builtin
+    let mut yolo_enabled = config.yolo;
     // Judgy mode state — initialized from config file, toggled by builtin
     let mut judgy_enabled = config.judgy;
     // Session history for judgy mode: records commands and AI commentary
@@ -372,7 +374,7 @@ fn run_interactive(config: &Config) -> ExitCode {
         }
     }
 
-    print_welcome(config.yolo, judgy_enabled);
+    print_welcome(yolo_enabled, judgy_enabled);
 
     loop {
         let prompt = format_prompt(&cwd, is_root, last_exit);
@@ -392,6 +394,7 @@ fn run_interactive(config: &Config) -> ExitCode {
                     let skip_judgy = matches!(
                         kind,
                         InputKind::Judgy(_)
+                            | InputKind::Yolo(_)
                             | InputKind::Help
                             | InputKind::Comment
                             | InputKind::Exit(_)
@@ -469,6 +472,24 @@ fn run_interactive(config: &Config) -> ExitCode {
                         }
                         0
                     }
+                    InputKind::Yolo(enable) => {
+                        yolo_enabled = enable;
+                        let yolo_file = config.config_dir.join("yolo");
+                        if enable {
+                            fs::write(&yolo_file, "").ok();
+                            eprintln!(
+                                "{}{}yolo mode enabled{} — AI commands run without confirmation",
+                                COLOR_BOLD, COLOR_YELLOW, COLOR_RESET
+                            );
+                        } else {
+                            fs::remove_file(&yolo_file).ok();
+                            eprintln!(
+                                "{}yolo mode disabled{}",
+                                COLOR_DIM, COLOR_RESET
+                            );
+                        }
+                        0
+                    }
                     InputKind::ForceBash(cmd) => {
                         let result = run_bash(&cmd, &cwd);
                         if result.exit_code != 0 && claude_available {
@@ -506,6 +527,7 @@ fn run_interactive(config: &Config) -> ExitCode {
                                 &cwd,
                                 &mut editor,
                                 config,
+                                yolo_enabled,
                             )
                         } else {
                             eprintln!(
@@ -630,6 +652,7 @@ enum InputKind {
     Explain(String),
     Ask(String),
     Judgy(bool),
+    Yolo(bool),
     ShellCommand(String),
     NaturalLanguage(String),
 }
@@ -662,6 +685,14 @@ fn classify_input(input: &str, path_commands: &HashSet<String>) -> InputKind {
     }
     if input == "judgy off" {
         return InputKind::Judgy(false);
+    }
+
+    // yolo on/off builtin
+    if input == "yolo on" || input == "yolo" {
+        return InputKind::Yolo(true);
+    }
+    if input == "yolo off" {
+        return InputKind::Yolo(false);
     }
 
     // ! prefix: force bash execution
@@ -1165,6 +1196,7 @@ fn handle_natural_language_interactive(
     cwd: &Path,
     editor: &mut DefaultEditor,
     config: &Config,
+    yolo: bool,
 ) -> i32 {
     let lower = text.to_lowercase();
     let is_complex = lower.contains(" and then ")
@@ -1203,7 +1235,7 @@ fn handle_natural_language_interactive(
             );
 
             // In yolo mode, execute immediately without confirmation
-            if config.yolo {
+            if yolo {
                 editor.add_history_entry(&cmd).ok();
                 let result = run_bash(&cmd, cwd);
                 if result.exit_code != 0 {
@@ -1537,6 +1569,7 @@ fn print_help() {
     {g}source{r} {d}FILE{r}           execute file in current shell context
     {g}history{r}               show command history
     {g}judgy{r} {d}[on|off]{r}        toggle judgy mode (AI commentary on every command)
+    {g}yolo{r} {d}[on|off]{r}         toggle yolo mode (skip AI command confirmation)
     {g}exit{r} {d}[N]{r}              exit with status N (default: last status)
     {g}help{r}                  this message
 
@@ -1552,6 +1585,7 @@ fn print_help() {
     {d}prompts/*.txt{r}          override AI system prompts
     {d}claudeshrc{r}             startup commands (like .bashrc)
     {d}history{r}                command history
+    {d}yolo{r}                   touch to enable yolo mode on startup
     {d}judgy{r}                  touch to enable judgy mode on startup
 
   {b}Examples:{r}
