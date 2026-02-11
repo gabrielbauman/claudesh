@@ -3,9 +3,13 @@ use rustyline::DefaultEditor;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+
+/// Max bytes of stderr to capture for error analysis (1 MB).
+/// Prevents unbounded memory growth from noisy commands.
+const STDERR_CAPTURE_LIMIT: usize = 1024 * 1024;
 
 // ─── Default prompts (overridable via ~/.claudesh/prompts/) ──────────────────
 
@@ -16,13 +20,15 @@ const DEFAULT_PROMPT_FIX: &str = include_str!("../defaults/prompts/fix.txt");
 const DEFAULT_PROMPT_SCRIPT: &str = include_str!("../defaults/prompts/script.txt");
 const DEFAULT_PERSONALITY: &str = include_str!("../defaults/personality");
 
+/// Shell builtins and keywords that should always be treated as commands, not
+/// natural language. Note: cd, exit, export, unset, source are handled as
+/// claudesh builtins before this list is checked.
 const SHELL_BUILTINS: &[&str] = &[
-    "cd", "exit", "quit", "export", "unset", "source", "history", "help", "alias", "unalias",
-    "set", "shopt", "type", "hash", "ulimit", "umask", "wait", "jobs", "fg", "bg", "disown",
-    "builtin", "command", "declare", "local", "readonly", "typeset", "let", "eval", "exec",
-    "trap", "return", "shift", "getopts", "read", "mapfile", "readarray", "printf", "echo",
-    "test", "true", "false", "for", "while", "if", "case", "select", "until", "do", "done",
-    "then", "else", "elif", "fi", "esac", "in",
+    "alias", "unalias", "set", "shopt", "type", "hash", "ulimit", "umask", "wait", "jobs",
+    "fg", "bg", "disown", "builtin", "command", "declare", "local", "readonly", "typeset",
+    "let", "eval", "exec", "trap", "return", "shift", "getopts", "read", "mapfile",
+    "readarray", "printf", "echo", "test", "true", "false", "for", "while", "if", "case",
+    "select", "until", "do", "done", "then", "else", "elif", "fi", "esac", "in",
 ];
 
 const COMMAND_PREFIXES: &[&str] = &[
@@ -136,14 +142,15 @@ fn main() -> ExitCode {
     }
 }
 
-/// Source profile files for login shells
+/// Source profile files for login shells.
+/// Runs bash to source profiles, then captures the resulting environment
+/// using a portable NUL-delimited approach (Python fallback for macOS).
 fn source_profile(cwd: &Path) {
-    // Source /etc/profile and ~/.profile via bash, then capture the environment
     let script = r#"
         [ -f /etc/profile ] && . /etc/profile 2>/dev/null
         [ -f ~/.profile ] && . ~/.profile 2>/dev/null
         [ -f ~/.bashrc ] && . ~/.bashrc 2>/dev/null
-        env -0
+        python3 -c 'import os,sys; [sys.stdout.buffer.write(f"{k}={v}\0".encode()) for k,v in os.environ.items()]' 2>/dev/null || env
     "#;
     let output = Command::new("bash")
         .arg("-c")
@@ -152,11 +159,25 @@ fn source_profile(cwd: &Path) {
         .output();
 
     if let Ok(out) = output {
-        let env_str = String::from_utf8_lossy(&out.stdout);
-        for entry in env_str.split('\0') {
-            if let Some((key, value)) = entry.split_once('=') {
-                if !key.is_empty() {
-                    env::set_var(key, value);
+        let bytes = &out.stdout;
+        // Try NUL-delimited first (from python3)
+        if bytes.contains(&0) {
+            let env_str = String::from_utf8_lossy(bytes);
+            for entry in env_str.split('\0') {
+                if let Some((key, value)) = entry.split_once('=') {
+                    if !key.is_empty() && !key.contains('\n') {
+                        env::set_var(key, value);
+                    }
+                }
+            }
+        } else {
+            // Fallback: newline-delimited from plain `env`
+            let env_str = String::from_utf8_lossy(bytes);
+            for line in env_str.lines() {
+                if let Some((key, value)) = line.split_once('=') {
+                    if !key.is_empty() {
+                        env::set_var(key, value);
+                    }
                 }
             }
         }
@@ -226,7 +247,8 @@ fn execute_line(
     editor: Option<&mut DefaultEditor>,
 ) -> i32 {
     match classify_input(input, path_commands) {
-        InputKind::Exit => std::process::exit(0),
+        InputKind::Exit(code) => std::process::exit(code.unwrap_or(0)),
+        InputKind::Comment => 0,
         InputKind::Help => {
             print_help();
             0
@@ -241,6 +263,10 @@ fn execute_line(
         }
         InputKind::Unset(name) => {
             env::remove_var(&name);
+            0
+        }
+        InputKind::Source(path) => {
+            handle_source(&path, cwd, path_commands, claude_available, config, editor);
             0
         }
         InputKind::History => {
@@ -275,7 +301,7 @@ fn execute_line(
         }
         InputKind::NaturalLanguage(text) => {
             if claude_available {
-                // Non-interactive natural language just generates the command and prints it
+                // Non-interactive: just generate the command and print it
                 let prompt = build_system_prompt(&config.prompt_generate, &config.personality);
                 if let Some(cmd) = call_claude(&prompt, &text, cwd) {
                     let cmd = strip_code_fences(&cmd);
@@ -349,10 +375,12 @@ fn run_interactive(config: &Config) -> ExitCode {
                 editor.add_history_entry(input).ok();
 
                 last_exit = match classify_input(input, &path_commands) {
-                    InputKind::Exit => {
+                    InputKind::Exit(code) => {
                         println!("{}bye{}", COLOR_DIM, COLOR_RESET);
+                        last_exit = code.unwrap_or(last_exit);
                         break;
                     }
+                    InputKind::Comment => continue,
                     InputKind::Help => {
                         print_help();
                         0
@@ -367,6 +395,17 @@ fn run_interactive(config: &Config) -> ExitCode {
                     }
                     InputKind::Unset(name) => {
                         env::remove_var(&name);
+                        0
+                    }
+                    InputKind::Source(path) => {
+                        handle_source(
+                            &path,
+                            &mut cwd,
+                            &path_commands,
+                            claude_available,
+                            config,
+                            Some(&mut editor),
+                        );
                         0
                     }
                     InputKind::History => {
@@ -517,12 +556,14 @@ fn build_system_prompt(base_prompt: &str, personality: &str) -> String {
 
 #[derive(Debug)]
 enum InputKind {
-    Exit,
+    Exit(Option<i32>),
     Help,
     Cd(String),
     Export(String),
     Unset(String),
+    Source(String),
     History,
+    Comment,
     ForceBash(String),
     Explain(String),
     Ask(String),
@@ -531,9 +572,20 @@ enum InputKind {
 }
 
 fn classify_input(input: &str, path_commands: &HashSet<String>) -> InputKind {
-    if input == "exit" || input == "quit" || input == "logout" {
-        return InputKind::Exit;
+    // Comments — skip silently
+    if input.starts_with('#') {
+        return InputKind::Comment;
     }
+
+    // exit/quit with optional exit code
+    if input == "exit" || input == "quit" || input == "logout" {
+        return InputKind::Exit(None);
+    }
+    if let Some(rest) = input.strip_prefix("exit ") {
+        let code = rest.trim().parse::<i32>().ok();
+        return InputKind::Exit(code);
+    }
+
     if input == "help" {
         return InputKind::Help;
     }
@@ -566,7 +618,7 @@ fn classify_input(input: &str, path_commands: &HashSet<String>) -> InputKind {
     }
 
     // cd builtin
-    if input == "cd" || input == "cd " {
+    if input == "cd" {
         return InputKind::Cd(String::new());
     }
     if let Some(dir) = input.strip_prefix("cd ") {
@@ -583,6 +635,14 @@ fn classify_input(input: &str, path_commands: &HashSet<String>) -> InputKind {
         return InputKind::Unset(name.trim().to_string());
     }
 
+    // source / . builtin
+    if let Some(path) = input.strip_prefix("source ") {
+        return InputKind::Source(path.trim().to_string());
+    }
+    if let Some(path) = input.strip_prefix(". ") {
+        return InputKind::Source(path.trim().to_string());
+    }
+
     // Check if it looks like a shell command
     if is_shell_command(input, path_commands) {
         InputKind::ShellCommand(input.to_string())
@@ -597,7 +657,7 @@ fn is_shell_command(input: &str, path_commands: &HashSet<String>) -> bool {
     // Shell syntax characters
     if matches!(
         first_char,
-        '/' | '.' | '~' | '(' | '{' | '[' | '$' | '<' | '>' | '#'
+        '/' | '.' | '~' | '(' | '{' | '[' | '$' | '<' | '>'
     ) {
         return true;
     }
@@ -665,7 +725,9 @@ fn build_path_command_set() -> HashSet<String> {
 // ─── Bash Execution ──────────────────────────────────────────────────────────
 
 /// Run a command via bash with inherited stdin/stdout.
-/// Stderr is tee'd: displayed in real-time AND captured for error analysis.
+/// Stderr is tee'd via raw byte forwarding: displayed in real-time AND
+/// captured for error analysis. Raw bytes preserve \r progress bars,
+/// ANSI color codes, and other terminal sequences.
 fn run_bash(cmd: &str, cwd: &Path) -> RunResult {
     let child = Command::new("bash")
         .arg("-c")
@@ -678,21 +740,28 @@ fn run_bash(cmd: &str, cwd: &Path) -> RunResult {
 
     match child {
         Ok(mut child) => {
-            let stderr_pipe = child.stderr.take().unwrap();
+            let mut stderr_pipe = child.stderr.take().unwrap();
             let stderr_thread = std::thread::spawn(move || {
-                let mut captured = String::new();
-                let reader = BufReader::new(stderr_pipe);
-                for line in reader.lines() {
-                    match line {
-                        Ok(line) => {
-                            eprintln!("{}", line);
-                            captured.push_str(&line);
-                            captured.push('\n');
+                let mut captured = Vec::new();
+                let mut buf = [0u8; 4096];
+                let mut stderr_out = io::stderr();
+                loop {
+                    match stderr_pipe.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            // Forward raw bytes to terminal
+                            stderr_out.write_all(&buf[..n]).ok();
+                            stderr_out.flush().ok();
+                            // Capture for error analysis (bounded)
+                            if captured.len() < STDERR_CAPTURE_LIMIT {
+                                let remaining = STDERR_CAPTURE_LIMIT - captured.len();
+                                captured.extend_from_slice(&buf[..n.min(remaining)]);
+                            }
                         }
                         Err(_) => break,
                     }
                 }
-                captured
+                String::from_utf8_lossy(&captured).to_string()
             });
 
             let status = child.wait();
@@ -722,6 +791,7 @@ fn run_bash(cmd: &str, cwd: &Path) -> RunResult {
 // ─── Builtins ────────────────────────────────────────────────────────────────
 
 fn handle_cd(dir: &str, cwd: &mut PathBuf) {
+    let dir = strip_shell_quotes(dir);
     let target = if dir.is_empty() {
         dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
     } else if dir == "-" {
@@ -733,7 +803,7 @@ fn handle_cd(dir: &str, cwd: &mut PathBuf) {
             return;
         }
     } else {
-        let expanded = shellexpand_tilde(dir);
+        let expanded = shellexpand_tilde(&dir);
         let path = Path::new(&expanded);
         if path.is_absolute() {
             path.to_path_buf()
@@ -773,22 +843,13 @@ fn handle_export(assignment: &str) {
     if let Some((key, value)) = assignment.split_once('=') {
         let key = key.trim();
         let value = value.trim();
-        let value = value
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            .or_else(|| {
-                value
-                    .strip_prefix('\'')
-                    .and_then(|v| v.strip_suffix('\''))
-            })
-            .unwrap_or(value);
-        env::set_var(key, value);
+        // Strip surrounding quotes
+        let value = strip_shell_quotes(value);
+        // Expand $VAR and ${VAR} references
+        let value = expand_env_vars(&value);
+        env::set_var(key, &value);
     } else {
         // `export VAR` without = is a no-op since env is inherited
-        eprintln!(
-            "{}(variable already exported to child processes){}",
-            COLOR_DIM, COLOR_RESET
-        );
     }
 }
 
@@ -811,9 +872,122 @@ fn shellexpand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+/// Strip surrounding quotes from a string: "foo" → foo, 'foo' → foo
+fn strip_shell_quotes(s: &str) -> String {
+    let s = s.trim();
+    if s.len() >= 2 {
+        if (s.starts_with('"') && s.ends_with('"'))
+            || (s.starts_with('\'') && s.ends_with('\''))
+        {
+            return s[1..s.len() - 1].to_string();
+        }
+    }
+    s.to_string()
+}
+
+/// Expand $VAR and ${VAR} references using the current environment.
+/// Single-quoted strings should NOT be passed through this (caller strips quotes first).
+fn expand_env_vars(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            let mut var_name = String::new();
+            let braced = chars.peek() == Some(&'{');
+            if braced {
+                chars.next(); // consume '{'
+                while let Some(&ch) = chars.peek() {
+                    if ch == '}' {
+                        chars.next();
+                        break;
+                    }
+                    var_name.push(ch);
+                    chars.next();
+                }
+            } else {
+                while let Some(&ch) = chars.peek() {
+                    if ch.is_ascii_alphanumeric() || ch == '_' {
+                        var_name.push(ch);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if var_name.is_empty() {
+                result.push('$');
+                if braced {
+                    result.push('{');
+                }
+            } else {
+                result.push_str(&env::var(&var_name).unwrap_or_default());
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Handle `source`/`.` builtin: run the file's commands in our shell context
+/// so that env changes (export, cd) propagate.
+fn handle_source(
+    path_arg: &str,
+    cwd: &mut PathBuf,
+    path_commands: &HashSet<String>,
+    claude_available: bool,
+    config: &Config,
+    editor: Option<&mut DefaultEditor>,
+) {
+    let expanded = shellexpand_tilde(path_arg.trim());
+    let file_path = if Path::new(&expanded).is_absolute() {
+        PathBuf::from(&expanded)
+    } else {
+        cwd.join(&expanded)
+    };
+
+    let contents = match fs::read_to_string(&file_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "{}source: {}: {}{}",
+                COLOR_RED,
+                file_path.display(),
+                e,
+                COLOR_RESET
+            );
+            return;
+        }
+    };
+
+    // We can't pass the editor Option through a loop (moved value), so we
+    // reborrow on each iteration if we have one.
+    match editor {
+        Some(ed) => {
+            for line in contents.lines() {
+                let input = line.trim();
+                if input.is_empty() || input.starts_with('#') {
+                    continue;
+                }
+                execute_line(input, cwd, path_commands, claude_available, config, Some(ed));
+            }
+        }
+        None => {
+            for line in contents.lines() {
+                let input = line.trim();
+                if input.is_empty() || input.starts_with('#') {
+                    continue;
+                }
+                execute_line(input, cwd, path_commands, claude_available, config, None);
+            }
+        }
+    }
+}
+
 fn is_user_root() -> bool {
     #[cfg(unix)]
     {
+        // Use libc geteuid() — works on both Linux and macOS
         unsafe { geteuid() == 0 }
     }
     #[cfg(not(unix))]
@@ -1234,10 +1408,11 @@ fn print_help() {
 
   {b}Builtins:{r}
     {g}cd{r} {d}[dir]{r}              change directory ({g}cd -{r} for previous)
-    {g}export{r} {d}KEY=VALUE{r}      set environment variable
+    {g}export{r} {d}KEY=VALUE{r}      set environment variable ({d}$VAR{r} expanded)
     {g}unset{r} {d}VAR{r}             remove environment variable
+    {g}source{r} {d}FILE{r}           execute file in current shell context
     {g}history{r}               show command history
-    {g}exit{r} / {g}quit{r}            exit the shell
+    {g}exit{r} {d}[N]{r}              exit with status N (default: last status)
     {g}help{r}                  this message
 
   {b}Shell modes:{r}
