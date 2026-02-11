@@ -18,6 +18,7 @@ const DEFAULT_PROMPT_EXPLAIN: &str = include_str!("../defaults/prompts/explain.t
 const DEFAULT_PROMPT_ASK: &str = include_str!("../defaults/prompts/ask.txt");
 const DEFAULT_PROMPT_FIX: &str = include_str!("../defaults/prompts/fix.txt");
 const DEFAULT_PROMPT_SCRIPT: &str = include_str!("../defaults/prompts/script.txt");
+const DEFAULT_PROMPT_JUDGY: &str = include_str!("../defaults/prompts/judgy.txt");
 const DEFAULT_PERSONALITY: &str = include_str!("../defaults/personality");
 
 /// Shell builtins and keywords that should always be treated as commands, not
@@ -43,6 +44,7 @@ const COLOR_YELLOW: &str = "\x1b[33m";
 const COLOR_MAGENTA: &str = "\x1b[35m";
 const COLOR_CYAN: &str = "\x1b[36m";
 const COLOR_RED: &str = "\x1b[31m";
+const COLOR_ITALIC: &str = "\x1b[3m";
 
 /// Loaded configuration from ~/.claudesh/
 struct Config {
@@ -51,9 +53,11 @@ struct Config {
     prompt_ask: String,
     prompt_fix: String,
     prompt_script: String,
+    prompt_judgy: String,
     personality: String,
     config_dir: PathBuf,
     yolo: bool,
+    judgy: bool,
 }
 
 /// Result of running a bash command
@@ -271,6 +275,10 @@ fn execute_line(
             }
             0
         }
+        InputKind::Judgy(_) | InputKind::Yolo(_) => {
+            // Handled only in interactive mode; no-op in non-interactive
+            0
+        }
         InputKind::ForceBash(cmd) => {
             let result = run_bash(&cmd, cwd);
             result.exit_code
@@ -338,6 +346,13 @@ fn run_interactive(config: &Config) -> ExitCode {
     let is_root = is_user_root();
     let mut last_exit: i32 = 0;
 
+    // Yolo mode state — initialized from config file, toggled by builtin
+    let mut yolo_enabled = config.yolo;
+    // Judgy mode state — initialized from config file, toggled by builtin
+    let mut judgy_enabled = config.judgy;
+    // Session history for judgy mode: records commands and AI commentary
+    let mut session_history: Vec<String> = Vec::new();
+
     // Source ~/.claudeshrc if it exists
     let rc_path = config.config_dir.join("claudeshrc");
     if rc_path.exists() {
@@ -359,7 +374,7 @@ fn run_interactive(config: &Config) -> ExitCode {
         }
     }
 
-    print_welcome(config.yolo);
+    print_welcome(yolo_enabled, judgy_enabled);
 
     loop {
         let prompt = format_prompt(&cwd, is_root, last_exit);
@@ -371,7 +386,39 @@ fn run_interactive(config: &Config) -> ExitCode {
                 }
                 editor.add_history_entry(input).ok();
 
-                last_exit = match classify_input(input, &path_commands) {
+                let kind = classify_input(input, &path_commands);
+
+                // Generate judgy commentary before executing the command
+                // (skip for meta commands like judgy toggle, help, comments, exit)
+                if judgy_enabled && claude_available {
+                    let skip_judgy = matches!(
+                        kind,
+                        InputKind::Judgy(_)
+                            | InputKind::Yolo(_)
+                            | InputKind::Help
+                            | InputKind::Comment
+                            | InputKind::Exit(_)
+                    );
+                    if !skip_judgy {
+                        if let Some(commentary) =
+                            generate_judgy_commentary(input, &session_history, &cwd, config)
+                        {
+                            eprintln!(
+                                "{}{}{}{}",
+                                COLOR_DIM, COLOR_ITALIC, commentary, COLOR_RESET
+                            );
+                            session_history
+                                .push(format!("[judgy]: {}", commentary));
+                        }
+                    }
+                }
+
+                // Record the command in session history
+                if judgy_enabled {
+                    session_history.push(format!("[user]: {}", input));
+                }
+
+                last_exit = match kind {
                     InputKind::Exit(code) => {
                         println!("{}bye{}", COLOR_DIM, COLOR_RESET);
                         last_exit = code.unwrap_or(last_exit);
@@ -401,6 +448,46 @@ fn run_interactive(config: &Config) -> ExitCode {
                     ),
                     InputKind::History => {
                         print_history(&editor);
+                        0
+                    }
+                    InputKind::Judgy(enable) => {
+                        judgy_enabled = enable;
+                        let judgy_file = config.config_dir.join("judgy");
+                        if enable {
+                            // Touch the file to persist the setting
+                            fs::write(&judgy_file, "").ok();
+                            session_history.clear();
+                            eprintln!(
+                                "{}{}judgy mode enabled{} — I'll be watching.",
+                                COLOR_ITALIC, COLOR_MAGENTA, COLOR_RESET
+                            );
+                        } else {
+                            // Remove the file to persist the setting
+                            fs::remove_file(&judgy_file).ok();
+                            session_history.clear();
+                            eprintln!(
+                                "{}judgy mode disabled{}",
+                                COLOR_DIM, COLOR_RESET
+                            );
+                        }
+                        0
+                    }
+                    InputKind::Yolo(enable) => {
+                        yolo_enabled = enable;
+                        let yolo_file = config.config_dir.join("yolo");
+                        if enable {
+                            fs::write(&yolo_file, "").ok();
+                            eprintln!(
+                                "{}{}yolo mode enabled{} — AI commands run without confirmation",
+                                COLOR_BOLD, COLOR_YELLOW, COLOR_RESET
+                            );
+                        } else {
+                            fs::remove_file(&yolo_file).ok();
+                            eprintln!(
+                                "{}yolo mode disabled{}",
+                                COLOR_DIM, COLOR_RESET
+                            );
+                        }
                         0
                     }
                     InputKind::ForceBash(cmd) => {
@@ -440,6 +527,7 @@ fn run_interactive(config: &Config) -> ExitCode {
                                 &cwd,
                                 &mut editor,
                                 config,
+                                yolo_enabled,
                             )
                         } else {
                             eprintln!(
@@ -487,8 +575,10 @@ fn load_config() -> Config {
     let prompt_ask = load_prompt_file(&prompts_dir, "ask.txt", DEFAULT_PROMPT_ASK);
     let prompt_fix = load_prompt_file(&prompts_dir, "fix.txt", DEFAULT_PROMPT_FIX);
     let prompt_script = load_prompt_file(&prompts_dir, "script.txt", DEFAULT_PROMPT_SCRIPT);
+    let prompt_judgy = load_prompt_file(&prompts_dir, "judgy.txt", DEFAULT_PROMPT_JUDGY);
     let personality = load_prompt_file(&config_dir, "personality", DEFAULT_PERSONALITY);
     let yolo = config_dir.join("yolo").exists();
+    let judgy = config_dir.join("judgy").exists();
 
     Config {
         prompt_generate,
@@ -496,9 +586,11 @@ fn load_config() -> Config {
         prompt_ask,
         prompt_fix,
         prompt_script,
+        prompt_judgy,
         personality,
         config_dir,
         yolo,
+        judgy,
     }
 }
 
@@ -525,6 +617,7 @@ fn ensure_config_dir(config: &Config) {
         write_default(&prompts_dir, "ask.txt", DEFAULT_PROMPT_ASK);
         write_default(&prompts_dir, "fix.txt", DEFAULT_PROMPT_FIX);
         write_default(&prompts_dir, "script.txt", DEFAULT_PROMPT_SCRIPT);
+        write_default(&prompts_dir, "judgy.txt", DEFAULT_PROMPT_JUDGY);
     }
 }
 
@@ -558,6 +651,8 @@ enum InputKind {
     ForceBash(String),
     Explain(String),
     Ask(String),
+    Judgy(bool),
+    Yolo(bool),
     ShellCommand(String),
     NaturalLanguage(String),
 }
@@ -582,6 +677,22 @@ fn classify_input(input: &str, path_commands: &HashSet<String>) -> InputKind {
     }
     if input == "history" {
         return InputKind::History;
+    }
+
+    // judgy on/off builtin
+    if input == "judgy on" || input == "judgy" {
+        return InputKind::Judgy(true);
+    }
+    if input == "judgy off" {
+        return InputKind::Judgy(false);
+    }
+
+    // yolo on/off builtin
+    if input == "yolo on" || input == "yolo" {
+        return InputKind::Yolo(true);
+    }
+    if input == "yolo off" {
+        return InputKind::Yolo(false);
     }
 
     // ! prefix: force bash execution
@@ -1053,11 +1164,39 @@ fn call_claude(system_prompt: &str, user_message: &str, cwd: &Path) -> Option<St
     }
 }
 
+/// Generate a single sentence of judgy commentary for the current command,
+/// given the full session history of commands and previous commentary.
+fn generate_judgy_commentary(
+    input: &str,
+    session_history: &[String],
+    cwd: &Path,
+    config: &Config,
+) -> Option<String> {
+    let prompt = build_system_prompt(&config.prompt_judgy, &config.personality);
+
+    // Build the full session transcript for context
+    let mut context = String::from("Session transcript so far:\n");
+    for entry in session_history {
+        context.push_str(entry);
+        context.push('\n');
+    }
+    context.push_str(&format!("\nThe user just typed: {}", input));
+
+    let result = call_claude(&prompt, &context, cwd);
+    // Ensure we only return a single line
+    result.map(|text| {
+        let text = text.trim().to_string();
+        // Take only the first sentence/line if the model got verbose
+        text.lines().next().unwrap_or(&text).to_string()
+    })
+}
+
 fn handle_natural_language_interactive(
     text: &str,
     cwd: &Path,
     editor: &mut DefaultEditor,
     config: &Config,
+    yolo: bool,
 ) -> i32 {
     let lower = text.to_lowercase();
     let is_complex = lower.contains(" and then ")
@@ -1096,7 +1235,7 @@ fn handle_natural_language_interactive(
             );
 
             // In yolo mode, execute immediately without confirmation
-            if config.yolo {
+            if yolo {
                 editor.add_history_entry(&cmd).ok();
                 let result = run_bash(&cmd, cwd);
                 if result.exit_code != 0 {
@@ -1375,7 +1514,7 @@ fn history_file_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claudesh").join("history"))
 }
 
-fn print_welcome(yolo: bool) {
+fn print_welcome(yolo: bool, judgy: bool) {
     println!(
         "\n  {}{}claudesh{} — AI-powered shell",
         COLOR_BOLD, COLOR_MAGENTA, COLOR_RESET
@@ -1388,6 +1527,12 @@ fn print_welcome(yolo: bool) {
         println!(
             "  {}{}yolo mode:{} AI-generated commands run without confirmation",
             COLOR_BOLD, COLOR_YELLOW, COLOR_RESET
+        );
+    }
+    if judgy {
+        println!(
+            "  {}{}judgy mode:{} the AI will judge your every command",
+            COLOR_ITALIC, COLOR_MAGENTA, COLOR_RESET
         );
     }
     println!(
@@ -1423,6 +1568,8 @@ fn print_help() {
     {g}unset{r} {d}VAR{r}             remove environment variable
     {g}source{r} {d}FILE{r}           execute file in current shell context
     {g}history{r}               show command history
+    {g}judgy{r} {d}[on|off]{r}        toggle judgy mode (AI commentary on every command)
+    {g}yolo{r} {d}[on|off]{r}         toggle yolo mode (skip AI command confirmation)
     {g}exit{r} {d}[N]{r}              exit with status N (default: last status)
     {g}help{r}                  this message
 
@@ -1438,6 +1585,8 @@ fn print_help() {
     {d}prompts/*.txt{r}          override AI system prompts
     {d}claudeshrc{r}             startup commands (like .bashrc)
     {d}history{r}                command history
+    {d}yolo{r}                   touch to enable yolo mode on startup
+    {d}judgy{r}                  touch to enable judgy mode on startup
 
   {b}Examples:{r}
     {d}$ ls -la{r}                                 {d}# just runs{r}
