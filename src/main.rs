@@ -306,11 +306,16 @@ fn execute_line(
         InputKind::NaturalLanguage(text) => {
             if claude_available {
                 // Non-interactive: just generate the command and print it.
-                // Don't apply personality — output must be only raw commands.
-                let prompt = config.prompt_generate.clone();
+                // Apply personality so conversational responses are in character.
+                let prompt = build_system_prompt(&config.prompt_generate, &config.personality);
                 if let Some(cmd) = call_claude(&prompt, &text, cwd) {
                     let cmd = strip_code_fences(&cmd);
-                    println!("{}", cmd);
+                    // Check if this is conversational (not a command)
+                    if let Some(message) = cmd.strip_prefix("CONVERSATIONAL:") {
+                        println!("{}", message.trim());
+                    } else {
+                        println!("{}", cmd);
+                    }
                 }
             } else {
                 eprintln!("claudesh: command not found: {}", input);
@@ -1220,8 +1225,9 @@ fn handle_natural_language_interactive(
         &config.prompt_generate
     };
 
-    // Don't apply personality to command generation — it must output only raw commands.
-    let prompt = base_prompt.to_string();
+    // Apply personality so conversational responses are in character.
+    // Command output itself is unaffected (raw commands only).
+    let prompt = build_system_prompt(base_prompt, &config.personality);
 
     eprint!(
         "{}{}thinking...{}",
@@ -1235,6 +1241,13 @@ fn handle_natural_language_interactive(
     match generated {
         Some(cmd) => {
             let cmd = strip_code_fences(&cmd);
+
+            // Check if this is conversational (not a command)
+            if let Some(message) = cmd.strip_prefix("CONVERSATIONAL:") {
+                println!("{}", message.trim());
+                return 0;
+            }
+
             println!(
                 "{}{}>{} {}",
                 COLOR_BOLD, COLOR_CYAN, COLOR_RESET, cmd
