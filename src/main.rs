@@ -297,8 +297,9 @@ fn execute_line(
         }
         InputKind::NaturalLanguage(text) => {
             if claude_available {
-                // Non-interactive: just generate the command and print it
-                let prompt = build_system_prompt(&config.prompt_generate, &config.personality);
+                // Non-interactive: just generate the command and print it.
+                // Don't apply personality — output must be only raw commands.
+                let prompt = config.prompt_generate.clone();
                 if let Some(cmd) = call_claude(&prompt, &text, cwd) {
                     let cmd = strip_code_fences(&cmd);
                     println!("{}", cmd);
@@ -1074,7 +1075,8 @@ fn handle_natural_language_interactive(
         &config.prompt_generate
     };
 
-    let prompt = build_system_prompt(base_prompt, &config.personality);
+    // Don't apply personality to command generation — it must output only raw commands.
+    let prompt = base_prompt.to_string();
 
     eprint!(
         "{}{}thinking...{}",
@@ -1266,7 +1268,8 @@ fn do_ai_error_analysis(
         cmd, exit_code, stderr
     );
 
-    let prompt = build_system_prompt(&config.prompt_fix, &config.personality);
+    // Don't apply personality to fix prompt — output must follow strict format for parsing.
+    let prompt = config.prompt_fix.clone();
 
     eprint!(
         "{}{}analyzing...{}",
