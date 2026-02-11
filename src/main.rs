@@ -313,6 +313,8 @@ fn execute_line(
                     // Check if this is conversational (not a command)
                     if let Some(message) = cmd.strip_prefix("CONVERSATIONAL:") {
                         println!("{}", message.trim());
+                    } else if looks_like_conversation(&cmd) {
+                        println!("{}", cmd);
                     } else {
                         println!("{}", cmd);
                     }
@@ -1202,6 +1204,47 @@ fn generate_judgy_commentary(
     })
 }
 
+/// Check if text looks like a conversational response rather than a shell command
+fn looks_like_conversation(text: &str) -> bool {
+    let text = text.trim();
+
+    // Empty or very short
+    if text.len() < 3 {
+        return false;
+    }
+
+    // Starts with conversational patterns
+    let lower = text.to_lowercase();
+    if lower.starts_with("hello")
+        || lower.starts_with("hi ")
+        || lower.starts_with("hey ")
+        || lower.starts_with("thanks")
+        || lower.starts_with("thank you")
+        || lower.starts_with("you're welcome")
+        || lower.starts_with("i ")
+        || lower.starts_with("sure")
+        || lower.starts_with("sorry")
+        || lower.starts_with("yes")
+        || lower.starts_with("no problem")
+        || lower.starts_with("of course")
+    {
+        return true;
+    }
+
+    // Contains conversational punctuation (questions, exclamations in non-command context)
+    // and doesn't look like shell syntax
+    if (text.contains('?') || text.contains('!'))
+        && !text.contains('|')
+        && !text.contains("&&")
+        && !text.contains(';')
+        && !text.starts_with('[')
+    {
+        return true;
+    }
+
+    false
+}
+
 fn handle_natural_language_interactive(
     text: &str,
     cwd: &Path,
@@ -1245,6 +1288,12 @@ fn handle_natural_language_interactive(
             // Check if this is conversational (not a command)
             if let Some(message) = cmd.strip_prefix("CONVERSATIONAL:") {
                 println!("{}", message.trim());
+                return 0;
+            }
+
+            // Secondary check: if it looks conversational, don't offer to run it
+            if looks_like_conversation(&cmd) {
+                println!("{}", cmd);
                 return 0;
             }
 
