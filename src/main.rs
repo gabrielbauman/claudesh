@@ -47,6 +47,7 @@ struct Config {
     prompt_script: String,
     personality: String,
     config_dir: PathBuf,
+    yolo: bool,
 }
 
 /// Result of running a bash command
@@ -335,7 +336,7 @@ fn run_interactive(config: &Config) -> ExitCode {
         }
     }
 
-    print_welcome();
+    print_welcome(config.yolo);
 
     loop {
         let prompt = format_prompt(&cwd, is_root, last_exit);
@@ -457,6 +458,7 @@ fn load_config() -> Config {
     let prompt_fix = load_prompt_file(&prompts_dir, "fix.txt", DEFAULT_PROMPT_FIX);
     let prompt_script = load_prompt_file(&prompts_dir, "script.txt", DEFAULT_PROMPT_SCRIPT);
     let personality = load_prompt_file(&config_dir, "personality", DEFAULT_PERSONALITY);
+    let yolo = config_dir.join("yolo").exists();
 
     Config {
         prompt_generate,
@@ -466,6 +468,7 @@ fn load_config() -> Config {
         prompt_script,
         personality,
         config_dir,
+        yolo,
     }
 }
 
@@ -908,6 +911,16 @@ fn handle_natural_language_interactive(
                 COLOR_BOLD, COLOR_CYAN, COLOR_RESET, cmd
             );
 
+            // In yolo mode, execute immediately without confirmation
+            if config.yolo {
+                editor.add_history_entry(&cmd).ok();
+                let result = run_bash(&cmd, cwd);
+                if result.exit_code != 0 {
+                    offer_error_help(&cmd, &result, cwd, editor, config);
+                }
+                return result.exit_code;
+            }
+
             eprint!(
                 "{}[enter] run / [e]dit / [s]kip{} ",
                 COLOR_DIM, COLOR_RESET
@@ -1177,7 +1190,7 @@ fn history_file_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claudesh").join("history"))
 }
 
-fn print_welcome() {
+fn print_welcome(yolo: bool) {
     println!(
         "\n  {}{}claudesh{} — AI-powered shell",
         COLOR_BOLD, COLOR_MAGENTA, COLOR_RESET
@@ -1186,6 +1199,12 @@ fn print_welcome() {
         "  {}type commands normally, or just say what you want in plain English{}",
         COLOR_DIM, COLOR_RESET
     );
+    if yolo {
+        println!(
+            "  {}{}yolo mode:{} AI-generated commands run without confirmation",
+            COLOR_BOLD, COLOR_YELLOW, COLOR_RESET
+        );
+    }
     println!(
         "  {}type{} help {}for more info{}\n",
         COLOR_DIM, COLOR_RESET, COLOR_DIM, COLOR_RESET

@@ -35,7 +35,7 @@ You can check with: lsof -i :8080
 ## Requirements
 
 - [Rust toolchain](https://rustup.rs/) (for building)
-- [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude` in PATH)
+- [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude` in PATH) — **required, build will fail without it**
 - bash
 
 ## Install
@@ -46,7 +46,9 @@ cd claudesh
 make install
 ```
 
-This installs `claudesh` to `/usr/local/bin`. Override with `PREFIX`:
+The build checks that the `claude` CLI is in your PATH and refuses to proceed without it. This is intentional — claudesh without Claude is just bash with extra steps.
+
+Install to `/usr/local/bin` (default) or override with `PREFIX`:
 
 ```sh
 make install PREFIX=$HOME/.local
@@ -113,6 +115,7 @@ On first run, claudesh creates `~/.claudesh/` with default config files:
 ├── personality            # AI personality (tone, style)
 ├── claudeshrc             # startup commands (like .bashrc)
 ├── history                # command history
+├── yolo                   # if this file exists, skip confirmation
 └── prompts/
     ├── generate.txt       # prompt for generating commands
     ├── explain.txt        # prompt for explaining commands
@@ -132,6 +135,20 @@ Or make it terse:
 
 ```
 Maximum 3 lines per response. No filler. Commands only.
+```
+
+### Yolo mode
+
+By default, when Claude generates a command from natural language, you're asked to confirm before it runs. If you trust the AI and want to live dangerously:
+
+```sh
+touch ~/.claudesh/yolo
+```
+
+This skips the `[enter] run / [e]dit / [s]kip` confirmation — generated commands execute immediately. The command is still printed so you can see what ran. Remove the file to go back to normal:
+
+```sh
+rm ~/.claudesh/yolo
 ```
 
 ## How command detection works
