@@ -389,11 +389,18 @@ fn run_interactive(config: &Config) -> ExitCode {
                 let kind = classify_input(input, &path_commands);
 
                 // Generate judgy commentary before executing the command
-                // (skip for meta commands like judgy toggle, help, comments, exit)
+                // (skip for shell commands, builtins, and meta commands)
                 if judgy_enabled && claude_available {
                     let skip_judgy = matches!(
                         kind,
-                        InputKind::Judgy(_)
+                        InputKind::ShellCommand(_)
+                            | InputKind::ForceBash(_)
+                            | InputKind::Cd(_)
+                            | InputKind::Export(_)
+                            | InputKind::Unset(_)
+                            | InputKind::Source(_)
+                            | InputKind::History
+                            | InputKind::Judgy(_)
                             | InputKind::Yolo(_)
                             | InputKind::Help
                             | InputKind::Comment
