@@ -1,5 +1,7 @@
 # claudesh
 
+> **Warning:** This shell executes AI-generated commands on your system. Commands are shown for review before running (unless you enable yolo mode), but you are responsible for what you execute. Use at your own risk.
+
 An AI-powered Unix shell. Type commands normally — they run via bash. Type plain English — Claude generates the command for you.
 
 ```
@@ -34,11 +36,18 @@ You can check with: lsof -i :8080
 
 ## Requirements
 
-- [Rust toolchain](https://rustup.rs/) (for building)
-- [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude` in PATH) — **required, build will fail without it**
-- bash
+You need all three of these before you start:
+
+1. **Rust toolchain** — install from [rustup.rs](https://rustup.rs/) if you don't have it:
+   ```sh
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   ```
+2. **Claude CLI** — the `claude` command must be in your PATH. Install from [Anthropic](https://docs.anthropic.com/en/docs/claude-code). The build **will refuse to proceed** without it.
+3. **bash** — already present on virtually every Linux and macOS system.
 
 ## Install
+
+### Linux / macOS
 
 ```sh
 git clone https://github.com/gabrielbauman/claudesh.git
@@ -46,29 +55,46 @@ cd claudesh
 make install
 ```
 
-The build checks that the `claude` CLI is in your PATH and refuses to proceed without it. This is intentional — claudesh without Claude is just bash with extra steps.
+This does three things:
+1. Checks that `claude` is in your PATH (fails with an error if not)
+2. Runs `cargo build --release` to compile the binary
+3. Installs the binary to `/usr/local/bin/claudesh`
 
-Install to `/usr/local/bin` (default) or override with `PREFIX`:
+To install somewhere else, set `PREFIX`:
 
 ```sh
-make install PREFIX=$HOME/.local
+make install PREFIX=$HOME/.local    # installs to ~/.local/bin/claudesh
 ```
 
-### Use as your login shell
+To uninstall:
 
 ```sh
-# Add to allowed shells
-echo /usr/local/bin/claudesh | sudo tee -a /etc/shells
-
-# Set as your shell
-chsh -s /usr/local/bin/claudesh
+make uninstall                      # or: make uninstall PREFIX=$HOME/.local
 ```
 
 ### Cargo install (alternative)
 
+If you prefer `cargo install` and have already verified `claude` is available:
+
 ```sh
 cargo install --path .
 ```
+
+This puts the binary in `~/.cargo/bin/claudesh`.
+
+### Use as your login shell
+
+Once installed, you can make claudesh your default shell:
+
+```sh
+# Add to the system's list of allowed shells
+echo /usr/local/bin/claudesh | sudo tee -a /etc/shells
+
+# Set it as your login shell
+chsh -s /usr/local/bin/claudesh
+```
+
+Adjust the path if you installed to a different `PREFIX`.
 
 ## Usage
 
@@ -175,6 +201,12 @@ claudesh follows standard Unix shell conventions:
 - `#` for root prompt, `>` for regular user
 - Ctrl-C / Ctrl-D handling
 - `$SHELL`, `$PWD`, `$OLDPWD` set correctly
+
+## Disclaimer
+
+claudesh sends your natural language input to the Claude API to generate shell commands. Those commands run on your machine with your permissions. While claudesh shows generated commands before executing them (unless yolo mode is enabled), AI can produce incorrect or destructive commands. Always review what you're about to run.
+
+This software is provided as-is with no warranty. You are solely responsible for any commands executed through this shell.
 
 ## License
 
