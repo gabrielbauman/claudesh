@@ -1,0 +1,10 @@
+[package]
+name = "claudesh"
+version = "0.1.0"
+edition = "2021"
+description = "An AI-powered Unix shell that understands both commands and plain English"
+
+[dependencies]
+rustyline = "15"
+which = "7"
+dirs = "6"
