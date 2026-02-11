@@ -128,7 +128,7 @@ claudesh -l                  # login shell (sources ~/.profile)
 
 ```
 ~/projects >              # normal prompt
-~/projects # >            # root user
+~/projects #              # root user
 ~/projects [1] >          # last command exited with code 1
 ```
 
@@ -143,14 +143,18 @@ On first run, claudesh creates `~/.claudesh/` with default config files:
 ├── history                # command history
 ├── yolo                   # if this file exists, skip confirmation
 └── prompts/
-    ├── generate.txt       # prompt for generating commands
-    ├── explain.txt        # prompt for explaining commands
-    ├── ask.txt            # prompt for answering questions
-    ├── fix.txt            # prompt for error diagnosis
-    └── script.txt         # prompt for multi-step scripts
+    ├── generate.txt       # command generation from natural language
+    ├── explain.txt        # ? command explanations
+    ├── ask.txt            # ?? question answering
+    ├── fix.txt            # error diagnosis when you press 'f'
+    └── script.txt         # multi-step/complex task generation
 ```
 
-Edit any file to customize behavior. For example, change `personality` to:
+Every file is plain text. Changes take effect next time claudesh starts.
+
+### Personality
+
+The `personality` file sets the tone for **all** AI responses. It's appended to every prompt sent to Claude. The default is a sardonic Unix veteran, but you can make it anything:
 
 ```
 You are a grumpy sysadmin who has been doing this since 1987.
@@ -161,6 +165,31 @@ Or make it terse:
 
 ```
 Maximum 3 lines per response. No filler. Commands only.
+```
+
+Or delete the file's contents to get neutral, unadorned responses.
+
+### Prompt files
+
+Each file in `~/.claudesh/prompts/` controls the system prompt for one specific feature:
+
+| File | Used when | What it controls |
+|---|---|---|
+| `generate.txt` | You type plain English like `show me disk usage` | How Claude turns your request into a shell command |
+| `script.txt` | You type something complex like `set up a new react project` | How Claude generates multi-step scripts |
+| `explain.txt` | You type `? some-command` | How Claude explains commands |
+| `ask.txt` | You type `?? some question` | How Claude answers general questions |
+| `fix.txt` | A command fails and you press `f` | How Claude diagnoses errors and suggests fixes |
+
+Edit these to change the AI's behavior for each use case. For example, you could edit `generate.txt` to always prefer `eza` over `ls`, or edit `fix.txt` to always suggest `brew install` instead of `apt install` on your Mac.
+
+### Startup file
+
+`~/.claudesh/claudeshrc` runs on every interactive startup, just like `.bashrc`. Use it for exports or any setup commands:
+
+```sh
+export EDITOR=vim
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 ### Yolo mode

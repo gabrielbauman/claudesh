@@ -253,10 +253,7 @@ fn execute_line(
             print_help();
             0
         }
-        InputKind::Cd(dir) => {
-            handle_cd(&dir, cwd);
-            0
-        }
+        InputKind::Cd(dir) => handle_cd(&dir, cwd),
         InputKind::Export(assignment) => {
             handle_export(&assignment);
             0
@@ -266,8 +263,7 @@ fn execute_line(
             0
         }
         InputKind::Source(path) => {
-            handle_source(&path, cwd, path_commands, claude_available, config, editor);
-            0
+            handle_source(&path, cwd, path_commands, claude_available, config, editor)
         }
         InputKind::History => {
             if let Some(ed) = editor {
@@ -385,10 +381,7 @@ fn run_interactive(config: &Config) -> ExitCode {
                         print_help();
                         0
                     }
-                    InputKind::Cd(dir) => {
-                        handle_cd(&dir, &mut cwd);
-                        0
-                    }
+                    InputKind::Cd(dir) => handle_cd(&dir, &mut cwd),
                     InputKind::Export(assignment) => {
                         handle_export(&assignment);
                         0
@@ -397,17 +390,14 @@ fn run_interactive(config: &Config) -> ExitCode {
                         env::remove_var(&name);
                         0
                     }
-                    InputKind::Source(path) => {
-                        handle_source(
-                            &path,
-                            &mut cwd,
-                            &path_commands,
-                            claude_available,
-                            config,
-                            Some(&mut editor),
-                        );
-                        0
-                    }
+                    InputKind::Source(path) => handle_source(
+                        &path,
+                        &mut cwd,
+                        &path_commands,
+                        claude_available,
+                        config,
+                        Some(&mut editor),
+                    ),
                     InputKind::History => {
                         print_history(&editor);
                         0
@@ -790,7 +780,7 @@ fn run_bash(cmd: &str, cwd: &Path) -> RunResult {
 
 // ─── Builtins ────────────────────────────────────────────────────────────────
 
-fn handle_cd(dir: &str, cwd: &mut PathBuf) {
+fn handle_cd(dir: &str, cwd: &mut PathBuf) -> i32 {
     let dir = strip_shell_quotes(dir);
     let target = if dir.is_empty() {
         dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
@@ -800,7 +790,7 @@ fn handle_cd(dir: &str, cwd: &mut PathBuf) {
             PathBuf::from(old)
         } else {
             eprintln!("{}cd: OLDPWD not set{}", COLOR_RED, COLOR_RESET);
-            return;
+            return 1;
         }
     } else {
         let expanded = shellexpand_tilde(&dir);
@@ -819,6 +809,7 @@ fn handle_cd(dir: &str, cwd: &mut PathBuf) {
                 *cwd = real_path.clone();
                 env::set_current_dir(&real_path).ok();
                 env::set_var("PWD", &real_path);
+                0
             } else {
                 eprintln!(
                     "{}cd: not a directory: {}{}",
@@ -826,6 +817,7 @@ fn handle_cd(dir: &str, cwd: &mut PathBuf) {
                     target.display(),
                     COLOR_RESET
                 );
+                1
             }
         }
         Err(_) => {
@@ -835,6 +827,7 @@ fn handle_cd(dir: &str, cwd: &mut PathBuf) {
                 target.display(),
                 COLOR_RESET
             );
+            1
         }
     }
 }
@@ -843,10 +836,18 @@ fn handle_export(assignment: &str) {
     if let Some((key, value)) = assignment.split_once('=') {
         let key = key.trim();
         let value = value.trim();
+        // Check if single-quoted (literal — no expansion, matching bash behavior)
+        let is_single_quoted =
+            value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'');
         // Strip surrounding quotes
         let value = strip_shell_quotes(value);
-        // Expand $VAR and ${VAR} references
-        let value = expand_env_vars(&value);
+        // Expand ~ at start and $VAR/${VAR} references (skip for single-quoted)
+        let value = shellexpand_tilde(&value);
+        let value = if is_single_quoted {
+            value
+        } else {
+            expand_env_vars(&value)
+        };
         env::set_var(key, &value);
     } else {
         // `export VAR` without = is a no-op since env is inherited
@@ -930,7 +931,8 @@ fn expand_env_vars(s: &str) -> String {
 }
 
 /// Handle `source`/`.` builtin: run the file's commands in our shell context
-/// so that env changes (export, cd) propagate.
+/// so that env changes (export, cd) propagate. Returns the exit code of the
+/// last command executed (matching bash behavior).
 fn handle_source(
     path_arg: &str,
     cwd: &mut PathBuf,
@@ -938,7 +940,7 @@ fn handle_source(
     claude_available: bool,
     config: &Config,
     editor: Option<&mut DefaultEditor>,
-) {
+) -> i32 {
     let expanded = shellexpand_tilde(path_arg.trim());
     let file_path = if Path::new(&expanded).is_absolute() {
         PathBuf::from(&expanded)
@@ -956,9 +958,11 @@ fn handle_source(
                 e,
                 COLOR_RESET
             );
-            return;
+            return 1;
         }
     };
+
+    let mut last_exit = 0;
 
     // We can't pass the editor Option through a loop (moved value), so we
     // reborrow on each iteration if we have one.
@@ -969,7 +973,8 @@ fn handle_source(
                 if input.is_empty() || input.starts_with('#') {
                     continue;
                 }
-                execute_line(input, cwd, path_commands, claude_available, config, Some(ed));
+                last_exit =
+                    execute_line(input, cwd, path_commands, claude_available, config, Some(ed));
             }
         }
         None => {
@@ -978,10 +983,13 @@ fn handle_source(
                 if input.is_empty() || input.starts_with('#') {
                     continue;
                 }
-                execute_line(input, cwd, path_commands, claude_available, config, None);
+                last_exit =
+                    execute_line(input, cwd, path_commands, claude_available, config, None);
             }
         }
     }
+
+    last_exit
 }
 
 fn is_user_root() -> bool {
