@@ -116,6 +116,8 @@ claudesh -l                  # login shell (sources ~/.profile)
 | `? tar -xzf foo.tar.gz` | Explains the command |
 | `?? how do ssh tunnels work` | Asks the AI a question |
 | `cd`, `export`, `unset` | Shell builtins handled natively |
+| `judgy` / `judgy on` / `judgy off` | Toggle judgy mode (snarky AI commentary on every command) |
+| `yolo` / `yolo on` / `yolo off` | Toggle yolo mode (skip AI command confirmation) |
 | `history` | Show command history |
 | `exit` / `quit` / Ctrl-D | Exit |
 
@@ -142,12 +144,14 @@ On first run, claudesh creates `~/.claudesh/` with default config files:
 ├── claudeshrc             # startup commands (like .bashrc)
 ├── history                # command history
 ├── yolo                   # if this file exists, skip confirmation
+├── judgy                  # if this file exists, enable judgy mode
 └── prompts/
     ├── generate.txt       # command generation from natural language
     ├── explain.txt        # ? command explanations
     ├── ask.txt            # ?? question answering
     ├── fix.txt            # error diagnosis when you press 'f'
-    └── script.txt         # multi-step/complex task generation
+    ├── script.txt         # multi-step/complex task generation
+    └── judgy.txt          # judgy mode commentary style
 ```
 
 Every file is plain text. Changes take effect next time claudesh starts.
@@ -180,6 +184,7 @@ Each file in `~/.claudesh/prompts/` controls the system prompt for one specific 
 | `explain.txt` | You type `? some-command` | How Claude explains commands |
 | `ask.txt` | You type `?? some question` | How Claude answers general questions |
 | `fix.txt` | A command fails and you press `f` | How Claude diagnoses errors and suggests fixes |
+| `judgy.txt` | Judgy mode is enabled | How Claude generates snarky commentary on your commands |
 
 Edit these to change the AI's behavior for each use case. For example, you could edit `generate.txt` to always prefer `eza` over `ls`, or edit `fix.txt` to always suggest `brew install` instead of `apt install` on your Mac.
 
@@ -192,18 +197,53 @@ export EDITOR=vim
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-### Yolo mode
+### Judgy mode
 
-By default, when Claude generates a command from natural language, you're asked to confirm before it runs. If you trust the AI and want to live dangerously:
+When judgy mode is enabled, the AI generates a single sentence of snarky commentary before every command you run. It watches your full session history, so its judgment evolves — repeat a mistake and it will escalate. Commentary appears in dim italics above the command output.
 
-```sh
-touch ~/.claudesh/yolo
+Toggle it at any time from the shell:
+
+```
+~/projects > judgy on
+judgy mode enabled — I'll be watching.
+
+~/projects > ls
+  Oh, listing the directory again. Groundbreaking.
+total 48
+...
+
+~/projects > judgy off
+judgy mode disabled
 ```
 
-This skips the `[enter] run / [e]dit / [s]kip` confirmation — generated commands execute immediately. The command is still printed so you can see what ran. Remove the file to go back to normal:
+The setting persists across sessions. You can also enable it by creating the file directly:
 
 ```sh
-rm ~/.claudesh/yolo
+touch ~/.claudesh/judgy    # enable
+rm ~/.claudesh/judgy       # disable
+```
+
+Customize the commentary style by editing `~/.claudesh/prompts/judgy.txt`.
+
+### Yolo mode
+
+By default, when Claude generates a command from natural language, you're asked to confirm before it runs. Yolo mode skips the `[enter] run / [e]dit / [s]kip` confirmation — generated commands execute immediately. The command is still printed so you can see what ran.
+
+Toggle it at any time from the shell:
+
+```
+~/projects > yolo on
+yolo mode enabled — AI commands run without confirmation
+
+~/projects > yolo off
+yolo mode disabled
+```
+
+The setting persists across sessions. You can also enable it by creating or removing the file directly:
+
+```sh
+touch ~/.claudesh/yolo     # enable
+rm ~/.claudesh/yolo        # disable
 ```
 
 ## How command detection works
