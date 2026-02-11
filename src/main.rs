@@ -1134,8 +1134,7 @@ fn call_claude(system_prompt: &str, user_message: &str, cwd: &Path) -> Option<St
 
     let output = Command::new("claude")
         .arg("--print")
-        .arg("--no-input")
-        .arg("--system")
+        .arg("--system-prompt")
         .arg(system_prompt)
         .arg(&context)
         .current_dir(cwd)
