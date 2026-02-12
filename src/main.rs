@@ -411,8 +411,8 @@ fn run_interactive(config: &Config) -> ExitCode {
 
                 let kind = classify_input(input, &path_commands);
 
-                // Generate judgy commentary before executing the command
-                // (skip for shell commands, builtins, and meta commands)
+                // Generate judgy commentary for Explain and Ask (NaturalLanguage handles its own)
+                // (skip for shell commands, builtins, meta commands, and NaturalLanguage)
                 if judgy_enabled && claude_available {
                     let skip_judgy = matches!(
                         kind,
@@ -428,11 +428,14 @@ fn run_interactive(config: &Config) -> ExitCode {
                             | InputKind::Help
                             | InputKind::Comment
                             | InputKind::Exit(_)
+                            | InputKind::NaturalLanguage(_) // NaturalLanguage handles judgy internally
                     );
                     if !skip_judgy {
+                        let _spinner = Spinner::new();
                         if let Some(commentary) =
                             generate_judgy_commentary(input, &session_history, &cwd, config)
                         {
+                            drop(_spinner);
                             eprintln!(
                                 "{}{}{}{}",
                                 COLOR_DIM, COLOR_ITALIC, commentary, COLOR_RESET
@@ -570,6 +573,8 @@ fn run_interactive(config: &Config) -> ExitCode {
                                 &mut editor,
                                 config,
                                 yolo_enabled,
+                                &mut session_history,
+                                judgy_enabled,
                             )
                         } else {
                             eprintln!(
@@ -1340,6 +1345,8 @@ fn handle_natural_language_interactive(
     editor: &mut DefaultEditor,
     config: &Config,
     yolo: bool,
+    session_history: &mut Vec<String>,
+    judgy_enabled: bool,
 ) -> i32 {
     let lower = text.to_lowercase();
     let is_complex = lower.contains(" and then ")
@@ -1362,8 +1369,52 @@ fn handle_natural_language_interactive(
     let prompt = build_system_prompt(base_prompt, &config.personality);
 
     let _spinner = Spinner::new();
-    let generated = call_claude(&prompt, text, cwd);
+
+    // Run judgy commentary and command generation in parallel if judgy is enabled
+    let (judgy_commentary, generated) = if judgy_enabled {
+        let judgy_prompt = build_system_prompt(&config.prompt_judgy, &config.personality);
+        let mut judgy_context = String::from("Session transcript so far:\n");
+        for entry in &*session_history {
+            judgy_context.push_str(entry);
+            judgy_context.push('\n');
+        }
+        judgy_context.push_str(&format!("\nThe user just typed: {}", text));
+
+        let cwd_clone = cwd.clone();
+        let cwd_clone2 = cwd.clone();
+        let prompt_clone = prompt.clone();
+        let judgy_prompt_clone = judgy_prompt.clone();
+        let text_str = text.to_string();
+        let judgy_context_clone = judgy_context.clone();
+
+        let judgy_handle = thread::spawn(move || {
+            call_claude(&judgy_prompt_clone, &judgy_context_clone, &cwd_clone)
+        });
+
+        let command_handle = thread::spawn(move || {
+            call_claude(&prompt_clone, &text_str, &cwd_clone2)
+        });
+
+        let judgy_result = judgy_handle.join().ok().flatten();
+        let command_result = command_handle.join().ok().flatten();
+
+        (judgy_result, command_result)
+    } else {
+        (None, call_claude(&prompt, text, cwd))
+    };
+
     drop(_spinner); // Explicitly stop spinner
+
+    // Display judgy commentary if we have it
+    if let Some(commentary) = judgy_commentary {
+        let commentary = commentary.trim();
+        let commentary = commentary.lines().next().unwrap_or(commentary);
+        eprintln!(
+            "{}{}{}{}",
+            COLOR_DIM, COLOR_ITALIC, commentary, COLOR_RESET
+        );
+        session_history.push(format!("[judgy]: {}", commentary));
+    }
 
     match generated {
         Some(cmd) => {
