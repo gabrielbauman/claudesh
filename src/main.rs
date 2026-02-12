@@ -6,6 +6,10 @@ use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 /// Max bytes of stderr to capture for error analysis (1 MB).
 /// Prevents unbounded memory growth from noisy commands.
@@ -259,12 +263,24 @@ fn execute_line(
         }
         InputKind::Cd(dir) => handle_cd(&dir, cwd),
         InputKind::Export(assignment) => {
-            handle_export(&assignment);
-            0
+            if assignment.is_empty() {
+                // Bare export - run through bash to show all exported vars
+                let result = run_bash("export", cwd);
+                result.exit_code
+            } else {
+                handle_export(&assignment);
+                0
+            }
         }
         InputKind::Unset(name) => {
-            env::remove_var(&name);
-            0
+            if name.is_empty() {
+                // Bare unset - run through bash (it's a no-op but keeps consistency)
+                let result = run_bash("unset", cwd);
+                result.exit_code
+            } else {
+                env::remove_var(&name);
+                0
+            }
         }
         InputKind::Source(path) => {
             handle_source(&path, cwd, path_commands, claude_available, config, editor)
@@ -306,11 +322,18 @@ fn execute_line(
         InputKind::NaturalLanguage(text) => {
             if claude_available {
                 // Non-interactive: just generate the command and print it.
-                // Don't apply personality — output must be only raw commands.
-                let prompt = config.prompt_generate.clone();
+                // Apply personality so conversational responses are in character.
+                let prompt = build_system_prompt(&config.prompt_generate, &config.personality);
                 if let Some(cmd) = call_claude(&prompt, &text, cwd) {
                     let cmd = strip_code_fences(&cmd);
-                    println!("{}", cmd);
+                    // Check if this is conversational (not a command)
+                    if let Some(message) = cmd.strip_prefix("CONVERSATIONAL:") {
+                        println!("{}", message.trim());
+                    } else if looks_like_conversation(&cmd) {
+                        println!("{}", cmd);
+                    } else {
+                        println!("{}", cmd);
+                    }
                 }
             } else {
                 eprintln!("claudesh: command not found: {}", input);
@@ -388,21 +411,31 @@ fn run_interactive(config: &Config) -> ExitCode {
 
                 let kind = classify_input(input, &path_commands);
 
-                // Generate judgy commentary before executing the command
-                // (skip for meta commands like judgy toggle, help, comments, exit)
+                // Generate judgy commentary for Explain and Ask (NaturalLanguage handles its own)
+                // (skip for shell commands, builtins, meta commands, and NaturalLanguage)
                 if judgy_enabled && claude_available {
                     let skip_judgy = matches!(
                         kind,
-                        InputKind::Judgy(_)
+                        InputKind::ShellCommand(_)
+                            | InputKind::ForceBash(_)
+                            | InputKind::Cd(_)
+                            | InputKind::Export(_)
+                            | InputKind::Unset(_)
+                            | InputKind::Source(_)
+                            | InputKind::History
+                            | InputKind::Judgy(_)
                             | InputKind::Yolo(_)
                             | InputKind::Help
                             | InputKind::Comment
                             | InputKind::Exit(_)
+                            | InputKind::NaturalLanguage(_) // NaturalLanguage handles judgy internally
                     );
                     if !skip_judgy {
+                        let _spinner = Spinner::new();
                         if let Some(commentary) =
                             generate_judgy_commentary(input, &session_history, &cwd, config)
                         {
+                            drop(_spinner);
                             eprintln!(
                                 "{}{}{}{}",
                                 COLOR_DIM, COLOR_ITALIC, commentary, COLOR_RESET
@@ -431,12 +464,24 @@ fn run_interactive(config: &Config) -> ExitCode {
                     }
                     InputKind::Cd(dir) => handle_cd(&dir, &mut cwd),
                     InputKind::Export(assignment) => {
-                        handle_export(&assignment);
-                        0
+                        if assignment.is_empty() {
+                            // Bare export - run through bash to show all exported vars
+                            let result = run_bash("export", &cwd);
+                            result.exit_code
+                        } else {
+                            handle_export(&assignment);
+                            0
+                        }
                     }
                     InputKind::Unset(name) => {
-                        env::remove_var(&name);
-                        0
+                        if name.is_empty() {
+                            // Bare unset - run through bash
+                            let result = run_bash("unset", &cwd);
+                            result.exit_code
+                        } else {
+                            env::remove_var(&name);
+                            0
+                        }
                     }
                     InputKind::Source(path) => handle_source(
                         &path,
@@ -524,10 +569,12 @@ fn run_interactive(config: &Config) -> ExitCode {
                         if claude_available {
                             handle_natural_language_interactive(
                                 &text,
-                                &cwd,
+                                &mut cwd,
                                 &mut editor,
                                 config,
                                 yolo_enabled,
+                                &mut session_history,
+                                judgy_enabled,
                             )
                         } else {
                             eprintln!(
@@ -728,11 +775,17 @@ fn classify_input(input: &str, path_commands: &HashSet<String>) -> InputKind {
     }
 
     // export builtin
+    if input == "export" {
+        return InputKind::Export(String::new());
+    }
     if let Some(assignment) = input.strip_prefix("export ") {
         return InputKind::Export(assignment.trim().to_string());
     }
 
     // unset builtin
+    if input == "unset" {
+        return InputKind::Unset(String::new());
+    }
     if let Some(name) = input.strip_prefix("unset ") {
         return InputKind::Unset(name.trim().to_string());
     }
@@ -1134,8 +1187,7 @@ fn call_claude(system_prompt: &str, user_message: &str, cwd: &Path) -> Option<St
 
     let output = Command::new("claude")
         .arg("--print")
-        .arg("--no-input")
-        .arg("--system")
+        .arg("--system-prompt")
         .arg(system_prompt)
         .arg(&context)
         .current_dir(cwd)
@@ -1191,12 +1243,110 @@ fn generate_judgy_commentary(
     })
 }
 
+/// Execute a command, handling builtins specially
+fn execute_generated_command(
+    cmd: &str,
+    cwd: &mut PathBuf,
+    editor: &mut DefaultEditor,
+    config: &Config,
+) -> i32 {
+    // Handle builtins specially (must affect claudesh's own process)
+    if cmd == "cd" || cmd.starts_with("cd ") {
+        let dir = cmd.strip_prefix("cd").unwrap_or("").trim();
+        return handle_cd(dir, cwd);
+    }
+    if cmd == "export" {
+        // Bare export - run through bash to show all exported vars
+        let result = run_bash(cmd, cwd);
+        if result.exit_code != 0 {
+            offer_error_help(cmd, &result, cwd, editor, config);
+        }
+        return result.exit_code;
+    }
+    if cmd.starts_with("export ") {
+        let assignment = cmd.strip_prefix("export ").unwrap().trim();
+        handle_export(assignment);
+        return 0;
+    }
+    if cmd == "unset" {
+        // Bare unset - run through bash
+        let result = run_bash(cmd, cwd);
+        if result.exit_code != 0 {
+            offer_error_help(cmd, &result, cwd, editor, config);
+        }
+        return result.exit_code;
+    }
+    if cmd.starts_with("unset ") {
+        let name = cmd.strip_prefix("unset ").unwrap().trim();
+        env::remove_var(name);
+        return 0;
+    }
+    if cmd.starts_with("source ") || cmd.starts_with(". ") {
+        let path = cmd
+            .strip_prefix("source ")
+            .or_else(|| cmd.strip_prefix(". "))
+            .unwrap()
+            .trim();
+        return handle_source(path, cwd, &HashSet::new(), true, config, Some(editor));
+    }
+
+    // Regular command - run through bash
+    let result = run_bash(cmd, cwd);
+    if result.exit_code != 0 {
+        offer_error_help(cmd, &result, cwd, editor, config);
+    }
+    result.exit_code
+}
+
+/// Check if text looks like a conversational response rather than a shell command
+fn looks_like_conversation(text: &str) -> bool {
+    let text = text.trim();
+
+    // Empty or very short
+    if text.len() < 3 {
+        return false;
+    }
+
+    // Starts with conversational patterns
+    let lower = text.to_lowercase();
+    if lower.starts_with("hello")
+        || lower.starts_with("hi ")
+        || lower.starts_with("hey ")
+        || lower.starts_with("thanks")
+        || lower.starts_with("thank you")
+        || lower.starts_with("you're welcome")
+        || lower.starts_with("i ")
+        || lower.starts_with("sure")
+        || lower.starts_with("sorry")
+        || lower.starts_with("yes")
+        || lower.starts_with("no problem")
+        || lower.starts_with("of course")
+    {
+        return true;
+    }
+
+    // Contains conversational punctuation (questions, exclamations in non-command context)
+    // and doesn't look like shell syntax
+    if (text.contains('?') || text.contains('!'))
+        && !text.contains('|')
+        && !text.contains("&&")
+        && !text.contains(';')
+        && !text.starts_with('[')
+    {
+        return true;
+    }
+
+    false
+}
+
 fn handle_natural_language_interactive(
     text: &str,
-    cwd: &Path,
+    cwd: &mut PathBuf,
     editor: &mut DefaultEditor,
     config: &Config,
     yolo: bool,
+    session_history: &mut Vec<String>,
+    judgy_enabled: bool,
 ) -> i32 {
     let lower = text.to_lowercase();
     let is_complex = lower.contains(" and then ")
@@ -1214,21 +1364,74 @@ fn handle_natural_language_interactive(
         &config.prompt_generate
     };
 
-    // Don't apply personality to command generation — it must output only raw commands.
-    let prompt = base_prompt.to_string();
+    // Apply personality so conversational responses are in character.
+    // Command output itself is unaffected (raw commands only).
+    let prompt = build_system_prompt(base_prompt, &config.personality);
 
-    eprint!(
-        "{}{}thinking...{}",
-        COLOR_DIM, COLOR_MAGENTA, COLOR_RESET
-    );
+    let _spinner = Spinner::new();
 
-    let generated = call_claude(&prompt, text, cwd);
+    // Run judgy commentary and command generation in parallel if judgy is enabled
+    let (judgy_commentary, generated) = if judgy_enabled {
+        let judgy_prompt = build_system_prompt(&config.prompt_judgy, &config.personality);
+        let mut judgy_context = String::from("Session transcript so far:\n");
+        for entry in &*session_history {
+            judgy_context.push_str(entry);
+            judgy_context.push('\n');
+        }
+        judgy_context.push_str(&format!("\nThe user just typed: {}", text));
 
-    eprint!("\r{}\r", " ".repeat(40));
+        let cwd_clone = cwd.clone();
+        let cwd_clone2 = cwd.clone();
+        let prompt_clone = prompt.clone();
+        let judgy_prompt_clone = judgy_prompt.clone();
+        let text_str = text.to_string();
+        let judgy_context_clone = judgy_context.clone();
+
+        let judgy_handle = thread::spawn(move || {
+            call_claude(&judgy_prompt_clone, &judgy_context_clone, &cwd_clone)
+        });
+
+        let command_handle = thread::spawn(move || {
+            call_claude(&prompt_clone, &text_str, &cwd_clone2)
+        });
+
+        let judgy_result = judgy_handle.join().ok().flatten();
+        let command_result = command_handle.join().ok().flatten();
+
+        (judgy_result, command_result)
+    } else {
+        (None, call_claude(&prompt, text, cwd))
+    };
+
+    drop(_spinner); // Explicitly stop spinner
+
+    // Display judgy commentary if we have it
+    if let Some(commentary) = judgy_commentary {
+        let commentary = commentary.trim();
+        let commentary = commentary.lines().next().unwrap_or(commentary);
+        eprintln!(
+            "{}{}{}{}",
+            COLOR_DIM, COLOR_ITALIC, commentary, COLOR_RESET
+        );
+        session_history.push(format!("[judgy]: {}", commentary));
+    }
 
     match generated {
         Some(cmd) => {
             let cmd = strip_code_fences(&cmd);
+
+            // Check if this is conversational (not a command)
+            if let Some(message) = cmd.strip_prefix("CONVERSATIONAL:") {
+                println!("{}", message.trim());
+                return 0;
+            }
+
+            // Secondary check: if it looks conversational, don't offer to run it
+            if looks_like_conversation(&cmd) {
+                println!("{}", cmd);
+                return 0;
+            }
+
             println!(
                 "{}{}>{} {}",
                 COLOR_BOLD, COLOR_CYAN, COLOR_RESET, cmd
@@ -1237,11 +1440,7 @@ fn handle_natural_language_interactive(
             // In yolo mode, execute immediately without confirmation
             if yolo {
                 editor.add_history_entry(&cmd).ok();
-                let result = run_bash(&cmd, cwd);
-                if result.exit_code != 0 {
-                    offer_error_help(&cmd, &result, cwd, editor, config);
-                }
-                return result.exit_code;
+                return execute_generated_command(&cmd, cwd, editor, config);
             }
 
             eprint!(
@@ -1254,11 +1453,7 @@ fn handle_natural_language_interactive(
             match choice.as_str() {
                 "" | "r" | "run" | "y" | "yes" => {
                     editor.add_history_entry(&cmd).ok();
-                    let result = run_bash(&cmd, cwd);
-                    if result.exit_code != 0 {
-                        offer_error_help(&cmd, &result, cwd, editor, config);
-                    }
-                    result.exit_code
+                    execute_generated_command(&cmd, cwd, editor, config)
                 }
                 "e" | "edit" => {
                     eprint!("{}> {}", COLOR_YELLOW, COLOR_RESET);
@@ -1267,11 +1462,7 @@ fn handle_natural_language_interactive(
                     let edited = edited.trim();
                     if !edited.is_empty() {
                         editor.add_history_entry(edited).ok();
-                        let result = run_bash(edited, cwd);
-                        if result.exit_code != 0 {
-                            offer_error_help(edited, &result, cwd, editor, config);
-                        }
-                        result.exit_code
+                        execute_generated_command(edited, cwd, editor, config)
                     } else {
                         0
                     }
@@ -1295,14 +1486,9 @@ fn handle_natural_language_interactive(
 fn explain_command(subject: &str, cwd: &Path, config: &Config) {
     let prompt = build_system_prompt(&config.prompt_explain, &config.personality);
 
-    eprint!(
-        "{}{}thinking...{}",
-        COLOR_DIM, COLOR_MAGENTA, COLOR_RESET
-    );
-
+    let _spinner = Spinner::new();
     let explanation = call_claude(&prompt, subject, cwd);
-
-    eprint!("\r{}\r", " ".repeat(40));
+    drop(_spinner);
 
     match explanation {
         Some(text) => {
@@ -1317,14 +1503,9 @@ fn explain_command(subject: &str, cwd: &Path, config: &Config) {
 fn ask_question(question: &str, cwd: &Path, config: &Config) {
     let prompt = build_system_prompt(&config.prompt_ask, &config.personality);
 
-    eprint!(
-        "{}{}thinking...{}",
-        COLOR_DIM, COLOR_MAGENTA, COLOR_RESET
-    );
-
+    let _spinner = Spinner::new();
     let answer = call_claude(&prompt, question, cwd);
-
-    eprint!("\r{}\r", " ".repeat(40));
+    drop(_spinner);
 
     match answer {
         Some(text) => {
@@ -1410,14 +1591,9 @@ fn do_ai_error_analysis(
     // Don't apply personality to fix prompt — output must follow strict format for parsing.
     let prompt = config.prompt_fix.clone();
 
-    eprint!(
-        "{}{}analyzing...{}",
-        COLOR_DIM, COLOR_MAGENTA, COLOR_RESET
-    );
-
+    let _spinner = Spinner::new();
     let help = call_claude(&prompt, &error_context, cwd);
-
-    eprint!("\r{}\r", " ".repeat(40));
+    drop(_spinner);
 
     if let Some(text) = help {
         let text = strip_code_fences(&text);
@@ -1452,20 +1628,70 @@ fn do_ai_error_analysis(
 
 fn strip_code_fences(s: &str) -> String {
     let s = s.trim();
-    if s.starts_with("```") {
-        let s = s
+
+    // If there's a code fence anywhere, extract only the code inside it
+    if let Some(start_idx) = s.find("```") {
+        let after_fence = &s[start_idx..];
+        let content = after_fence
             .trim_start_matches("```bash")
             .trim_start_matches("```sh")
             .trim_start_matches("```shell")
             .trim_start_matches("```");
-        let s = if let Some(idx) = s.rfind("```") {
-            &s[..idx]
+
+        let code = if let Some(end_idx) = content.rfind("```") {
+            &content[..end_idx]
         } else {
-            s
+            content
         };
-        return s.trim().to_string();
+
+        return code.trim().to_string();
     }
+
     s.to_string()
+}
+
+// ─── Spinner ─────────────────────────────────────────────────────────────────
+
+struct Spinner {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Spinner {
+    fn new() -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+
+        let handle = thread::spawn(move || {
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let mut idx = 0;
+
+            while !stop_clone.load(Ordering::Relaxed) {
+                eprint!("\r{}{}{} ", COLOR_DIM, frames[idx], COLOR_RESET);
+                io::stderr().flush().ok();
+                idx = (idx + 1) % frames.len();
+                thread::sleep(Duration::from_millis(80));
+            }
+
+            // Clear the spinner when done
+            eprint!("\r \r");
+            io::stderr().flush().ok();
+        });
+
+        Spinner {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle.join().ok();
+        }
+    }
 }
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
