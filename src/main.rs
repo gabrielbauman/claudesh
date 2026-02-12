@@ -259,12 +259,24 @@ fn execute_line(
         }
         InputKind::Cd(dir) => handle_cd(&dir, cwd),
         InputKind::Export(assignment) => {
-            handle_export(&assignment);
-            0
+            if assignment.is_empty() {
+                // Bare export - run through bash to show all exported vars
+                let result = run_bash("export", cwd);
+                result.exit_code
+            } else {
+                handle_export(&assignment);
+                0
+            }
         }
         InputKind::Unset(name) => {
-            env::remove_var(&name);
-            0
+            if name.is_empty() {
+                // Bare unset - run through bash (it's a no-op but keeps consistency)
+                let result = run_bash("unset", cwd);
+                result.exit_code
+            } else {
+                env::remove_var(&name);
+                0
+            }
         }
         InputKind::Source(path) => {
             handle_source(&path, cwd, path_commands, claude_available, config, editor)
@@ -445,12 +457,24 @@ fn run_interactive(config: &Config) -> ExitCode {
                     }
                     InputKind::Cd(dir) => handle_cd(&dir, &mut cwd),
                     InputKind::Export(assignment) => {
-                        handle_export(&assignment);
-                        0
+                        if assignment.is_empty() {
+                            // Bare export - run through bash to show all exported vars
+                            let result = run_bash("export", &cwd);
+                            result.exit_code
+                        } else {
+                            handle_export(&assignment);
+                            0
+                        }
                     }
                     InputKind::Unset(name) => {
-                        env::remove_var(&name);
-                        0
+                        if name.is_empty() {
+                            // Bare unset - run through bash
+                            let result = run_bash("unset", &cwd);
+                            result.exit_code
+                        } else {
+                            env::remove_var(&name);
+                            0
+                        }
                     }
                     InputKind::Source(path) => handle_source(
                         &path,
@@ -1222,10 +1246,26 @@ fn execute_generated_command(
         let dir = cmd.strip_prefix("cd").unwrap_or("").trim();
         return handle_cd(dir, cwd);
     }
+    if cmd == "export" {
+        // Bare export - run through bash to show all exported vars
+        let result = run_bash(cmd, cwd);
+        if result.exit_code != 0 {
+            offer_error_help(cmd, &result, cwd, editor, config);
+        }
+        return result.exit_code;
+    }
     if cmd.starts_with("export ") {
         let assignment = cmd.strip_prefix("export ").unwrap().trim();
         handle_export(assignment);
         return 0;
+    }
+    if cmd == "unset" {
+        // Bare unset - run through bash
+        let result = run_bash(cmd, cwd);
+        if result.exit_code != 0 {
+            offer_error_help(cmd, &result, cwd, editor, config);
+        }
+        return result.exit_code;
     }
     if cmd.starts_with("unset ") {
         let name = cmd.strip_prefix("unset ").unwrap().trim();
