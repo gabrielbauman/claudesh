@@ -538,7 +538,7 @@ fn run_interactive(config: &Config) -> ExitCode {
                         if claude_available {
                             handle_natural_language_interactive(
                                 &text,
-                                &cwd,
+                                &mut cwd,
                                 &mut editor,
                                 config,
                                 yolo_enabled,
@@ -1204,6 +1204,45 @@ fn generate_judgy_commentary(
     })
 }
 
+/// Execute a command, handling builtins specially
+fn execute_generated_command(
+    cmd: &str,
+    cwd: &mut PathBuf,
+    editor: &mut DefaultEditor,
+    config: &Config,
+) -> i32 {
+    // Handle builtins specially (must affect claudesh's own process)
+    if cmd == "cd" || cmd.starts_with("cd ") {
+        let dir = cmd.strip_prefix("cd").unwrap_or("").trim();
+        return handle_cd(dir, cwd);
+    }
+    if cmd.starts_with("export ") {
+        let assignment = cmd.strip_prefix("export ").unwrap().trim();
+        handle_export(assignment);
+        return 0;
+    }
+    if cmd.starts_with("unset ") {
+        let name = cmd.strip_prefix("unset ").unwrap().trim();
+        env::remove_var(name);
+        return 0;
+    }
+    if cmd.starts_with("source ") || cmd.starts_with(". ") {
+        let path = cmd
+            .strip_prefix("source ")
+            .or_else(|| cmd.strip_prefix(". "))
+            .unwrap()
+            .trim();
+        return handle_source(path, cwd, &HashSet::new(), true, config, Some(editor));
+    }
+
+    // Regular command - run through bash
+    let result = run_bash(cmd, cwd);
+    if result.exit_code != 0 {
+        offer_error_help(cmd, &result, cwd, editor, config);
+    }
+    result.exit_code
+}
+
 /// Check if text looks like a conversational response rather than a shell command
 fn looks_like_conversation(text: &str) -> bool {
     let text = text.trim();
@@ -1247,7 +1286,7 @@ fn looks_like_conversation(text: &str) -> bool {
 
 fn handle_natural_language_interactive(
     text: &str,
-    cwd: &Path,
+    cwd: &mut PathBuf,
     editor: &mut DefaultEditor,
     config: &Config,
     yolo: bool,
@@ -1305,11 +1344,7 @@ fn handle_natural_language_interactive(
             // In yolo mode, execute immediately without confirmation
             if yolo {
                 editor.add_history_entry(&cmd).ok();
-                let result = run_bash(&cmd, cwd);
-                if result.exit_code != 0 {
-                    offer_error_help(&cmd, &result, cwd, editor, config);
-                }
-                return result.exit_code;
+                return execute_generated_command(&cmd, cwd, editor, config);
             }
 
             eprint!(
@@ -1322,11 +1357,7 @@ fn handle_natural_language_interactive(
             match choice.as_str() {
                 "" | "r" | "run" | "y" | "yes" => {
                     editor.add_history_entry(&cmd).ok();
-                    let result = run_bash(&cmd, cwd);
-                    if result.exit_code != 0 {
-                        offer_error_help(&cmd, &result, cwd, editor, config);
-                    }
-                    result.exit_code
+                    execute_generated_command(&cmd, cwd, editor, config)
                 }
                 "e" | "edit" => {
                     eprint!("{}> {}", COLOR_YELLOW, COLOR_RESET);
@@ -1335,11 +1366,7 @@ fn handle_natural_language_interactive(
                     let edited = edited.trim();
                     if !edited.is_empty() {
                         editor.add_history_entry(edited).ok();
-                        let result = run_bash(edited, cwd);
-                        if result.exit_code != 0 {
-                            offer_error_help(edited, &result, cwd, editor, config);
-                        }
-                        result.exit_code
+                        execute_generated_command(edited, cwd, editor, config)
                     } else {
                         0
                     }
