@@ -742,11 +742,17 @@ fn classify_input(input: &str, path_commands: &HashSet<String>) -> InputKind {
     }
 
     // export builtin
+    if input == "export" {
+        return InputKind::Export(String::new());
+    }
     if let Some(assignment) = input.strip_prefix("export ") {
         return InputKind::Export(assignment.trim().to_string());
     }
 
     // unset builtin
+    if input == "unset" {
+        return InputKind::Unset(String::new());
+    }
     if let Some(name) = input.strip_prefix("unset ") {
         return InputKind::Unset(name.trim().to_string());
     }
