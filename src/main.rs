@@ -1520,19 +1520,25 @@ fn do_ai_error_analysis(
 
 fn strip_code_fences(s: &str) -> String {
     let s = s.trim();
-    if s.starts_with("```") {
-        let s = s
+
+    // If there's a code fence anywhere, extract only the code inside it
+    if let Some(start_idx) = s.find("```") {
+        let after_fence = &s[start_idx..];
+        let content = after_fence
             .trim_start_matches("```bash")
             .trim_start_matches("```sh")
             .trim_start_matches("```shell")
             .trim_start_matches("```");
-        let s = if let Some(idx) = s.rfind("```") {
-            &s[..idx]
+
+        let code = if let Some(end_idx) = content.rfind("```") {
+            &content[..end_idx]
         } else {
-            s
+            content
         };
-        return s.trim().to_string();
+
+        return code.trim().to_string();
     }
+
     s.to_string()
 }
 
