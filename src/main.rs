@@ -6,6 +6,10 @@ use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 /// Max bytes of stderr to capture for error analysis (1 MB).
 /// Prevents unbounded memory growth from noisy commands.
@@ -1357,14 +1361,9 @@ fn handle_natural_language_interactive(
     // Command output itself is unaffected (raw commands only).
     let prompt = build_system_prompt(base_prompt, &config.personality);
 
-    eprint!(
-        "{}{}thinking...{}",
-        COLOR_DIM, COLOR_MAGENTA, COLOR_RESET
-    );
-
+    let _spinner = Spinner::new();
     let generated = call_claude(&prompt, text, cwd);
-
-    eprint!("\r{}\r", " ".repeat(40));
+    drop(_spinner); // Explicitly stop spinner
 
     match generated {
         Some(cmd) => {
@@ -1436,14 +1435,9 @@ fn handle_natural_language_interactive(
 fn explain_command(subject: &str, cwd: &Path, config: &Config) {
     let prompt = build_system_prompt(&config.prompt_explain, &config.personality);
 
-    eprint!(
-        "{}{}thinking...{}",
-        COLOR_DIM, COLOR_MAGENTA, COLOR_RESET
-    );
-
+    let _spinner = Spinner::new();
     let explanation = call_claude(&prompt, subject, cwd);
-
-    eprint!("\r{}\r", " ".repeat(40));
+    drop(_spinner);
 
     match explanation {
         Some(text) => {
@@ -1458,14 +1452,9 @@ fn explain_command(subject: &str, cwd: &Path, config: &Config) {
 fn ask_question(question: &str, cwd: &Path, config: &Config) {
     let prompt = build_system_prompt(&config.prompt_ask, &config.personality);
 
-    eprint!(
-        "{}{}thinking...{}",
-        COLOR_DIM, COLOR_MAGENTA, COLOR_RESET
-    );
-
+    let _spinner = Spinner::new();
     let answer = call_claude(&prompt, question, cwd);
-
-    eprint!("\r{}\r", " ".repeat(40));
+    drop(_spinner);
 
     match answer {
         Some(text) => {
@@ -1551,14 +1540,9 @@ fn do_ai_error_analysis(
     // Don't apply personality to fix prompt — output must follow strict format for parsing.
     let prompt = config.prompt_fix.clone();
 
-    eprint!(
-        "{}{}analyzing...{}",
-        COLOR_DIM, COLOR_MAGENTA, COLOR_RESET
-    );
-
+    let _spinner = Spinner::new();
     let help = call_claude(&prompt, &error_context, cwd);
-
-    eprint!("\r{}\r", " ".repeat(40));
+    drop(_spinner);
 
     if let Some(text) = help {
         let text = strip_code_fences(&text);
@@ -1613,6 +1597,50 @@ fn strip_code_fences(s: &str) -> String {
     }
 
     s.to_string()
+}
+
+// ─── Spinner ─────────────────────────────────────────────────────────────────
+
+struct Spinner {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Spinner {
+    fn new() -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+
+        let handle = thread::spawn(move || {
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let mut idx = 0;
+
+            while !stop_clone.load(Ordering::Relaxed) {
+                eprint!("\r{}{}{} ", COLOR_DIM, frames[idx], COLOR_RESET);
+                io::stderr().flush().ok();
+                idx = (idx + 1) % frames.len();
+                thread::sleep(Duration::from_millis(80));
+            }
+
+            // Clear the spinner when done
+            eprint!("\r \r");
+            io::stderr().flush().ok();
+        });
+
+        Spinner {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle.join().ok();
+        }
+    }
 }
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
